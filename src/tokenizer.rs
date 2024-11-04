@@ -30,9 +30,7 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-use core::iter::Peekable;
 use core::num::NonZeroU8;
-use core::str::Chars;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -40,7 +38,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "visitor")]
 use sqlparser_derive::{Visit, VisitMut};
 
-use crate::ast::DollarQuotedString;
+use crate::{ast::DollarQuotedString, parser::lazy_tokens::LookAheadIterator};
 use crate::dialect::Dialect;
 use crate::dialect::{
     BigQueryDialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
@@ -498,13 +496,13 @@ impl fmt::Display for TokenizerError {
 #[cfg(feature = "std")]
 impl std::error::Error for TokenizerError {}
 
-struct State<'a> {
-    peekable: Peekable<Chars<'a>>,
+pub(crate) struct State<I> where I: Iterator<Item = char> {
+    pub(crate) peekable: LookAheadIterator<I>,
     pub line: u64,
     pub col: u64,
 }
 
-impl<'a> State<'a> {
+impl<I: Iterator<Item = char>> State<I> {
     /// return the next character and advance the stream
     pub fn next(&mut self) -> Option<char> {
         match self.peekable.next() {
@@ -563,7 +561,6 @@ struct TokenizeQuotedStringSettings {
 /// SQL Tokenizer
 pub struct Tokenizer<'a> {
     dialect: &'a dyn Dialect,
-    query: &'a str,
     /// If true (the default), the tokenizer will un-escape literal
     /// SQL strings See [`Tokenizer::with_unescape`] for more details.
     unescape: bool,
@@ -586,10 +583,9 @@ impl<'a> Tokenizer<'a> {
     ///   Token::Whitespace(Whitespace::Space),
     ///   Token::SingleQuotedString("foo".to_string()),
     /// ]);
-    pub fn new(dialect: &'a dyn Dialect, query: &'a str) -> Self {
+    pub fn new(dialect: &'a dyn Dialect) -> Self {
         Self {
             dialect,
-            query,
             unescape: true,
         }
     }
@@ -629,45 +625,11 @@ impl<'a> Tokenizer<'a> {
         self
     }
 
-    /// Tokenize the statement and produce a vector of tokens
-    pub fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
-        let twl = self.tokenize_with_location()?;
-        Ok(twl.into_iter().map(|t| t.token).collect())
-    }
-
-    /// Tokenize the statement and produce a vector of tokens with location information
-    pub fn tokenize_with_location(&mut self) -> Result<Vec<TokenWithLocation>, TokenizerError> {
-        let mut tokens: Vec<TokenWithLocation> = vec![];
-        self.tokenize_with_location_into_buf(&mut tokens)
-            .map(|_| tokens)
-    }
-
-    /// Tokenize the statement and append tokens with location information into the provided buffer.
-    /// If an error is thrown, the buffer will contain all tokens that were successfully parsed before the error.
-    pub fn tokenize_with_location_into_buf(
-        &mut self,
-        buf: &mut Vec<TokenWithLocation>,
-    ) -> Result<(), TokenizerError> {
-        let mut state = State {
-            peekable: self.query.chars().peekable(),
-            line: 1,
-            col: 1,
-        };
-
-        let mut location = state.location();
-        while let Some(token) = self.next_token(&mut state)? {
-            buf.push(TokenWithLocation { token, location });
-
-            location = state.location();
-        }
-        Ok(())
-    }
-
     // Tokenize the identifier or keywords in `ch`
-    fn tokenize_identifier_or_keyword(
+    fn tokenize_identifier_or_keyword<I: Iterator<Item = char>>(
         &self,
         ch: impl IntoIterator<Item = char>,
-        chars: &mut State,
+        chars: &mut State<I>,
     ) -> Result<Option<Token>, TokenizerError> {
         chars.next(); // consume the first char
         let ch: String = ch.into_iter().collect();
@@ -676,7 +638,7 @@ impl<'a> Tokenizer<'a> {
         // TODO: implement parsing of exponent here
         if word.chars().all(|x| x.is_ascii_digit() || x == '.') {
             let mut inner_state = State {
-                peekable: word.chars().peekable(),
+                peekable: LookAheadIterator::new(word.chars()),
                 line: 0,
                 col: 0,
             };
@@ -690,7 +652,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Get the next token or return None
-    fn next_token(&self, chars: &mut State) -> Result<Option<Token>, TokenizerError> {
+    pub(crate) fn next_token<I: Iterator<Item = char>>(&self, chars: &mut State<I>) -> Result<Option<Token>, TokenizerError> {
         match chars.peek() {
             Some(&ch) => match ch {
                 ' ' => self.consume_and_return(chars, Token::Whitespace(Whitespace::Space)),
@@ -711,7 +673,7 @@ impl<'a> Tokenizer<'a> {
                         Some('\'') => {
                             if self.dialect.supports_triple_quoted_string() {
                                 return self
-                                    .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
+                                    .tokenize_single_or_triple_quoted_string::<fn(String) -> Token, _>(
                                         chars,
                                         '\'',
                                         false,
@@ -725,7 +687,7 @@ impl<'a> Tokenizer<'a> {
                         Some('\"') => {
                             if self.dialect.supports_triple_quoted_string() {
                                 return self
-                                    .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
+                                    .tokenize_single_or_triple_quoted_string::<fn(String) -> Token, _>(
                                         chars,
                                         '"',
                                         false,
@@ -748,7 +710,7 @@ impl<'a> Tokenizer<'a> {
                     chars.next(); // consume
                     match chars.peek() {
                         Some('\'') => self
-                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
+                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token, _>(
                                 chars,
                                 '\'',
                                 false,
@@ -756,7 +718,7 @@ impl<'a> Tokenizer<'a> {
                                 Token::TripleSingleQuotedRawStringLiteral,
                             ),
                         Some('\"') => self
-                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
+                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token, _>(
                                 chars,
                                 '"',
                                 false,
@@ -808,7 +770,7 @@ impl<'a> Tokenizer<'a> {
                     chars.next(); // consume, to check the next char
                     if chars.peek() == Some(&'&') {
                         // we cannot advance the iterator here, as we need to consume the '&' later if the 'u' was an identifier
-                        let mut chars_clone = chars.peekable.clone();
+                        let mut chars_clone = chars.peekable.lookahead().peekable();
                         chars_clone.next(); // consume the '&' in the clone
                         if chars_clone.peek() == Some(&'\'') {
                             chars.next(); // consume the '&' in the original iterator
@@ -841,7 +803,7 @@ impl<'a> Tokenizer<'a> {
                 '\'' => {
                     if self.dialect.supports_triple_quoted_string() {
                         return self
-                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
+                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token, _>(
                                 chars,
                                 '\'',
                                 self.dialect.supports_string_literal_backslash_escape(),
@@ -863,7 +825,7 @@ impl<'a> Tokenizer<'a> {
                 {
                     if self.dialect.supports_triple_quoted_string() {
                         return self
-                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token>(
+                            .tokenize_single_or_triple_quoted_string::<fn(String) -> Token, _>(
                                 chars,
                                 '"',
                                 self.dialect.supports_string_literal_backslash_escape(),
@@ -884,7 +846,7 @@ impl<'a> Tokenizer<'a> {
                     if self.dialect.is_delimited_identifier_start(ch)
                         && self
                             .dialect
-                            .is_proper_identifier_inside_quotes(chars.peekable.clone()) =>
+                            .is_proper_identifier_inside_quotes() =>
                 {
                     let error_loc = chars.location();
                     chars.next(); // consume the opening quote
@@ -926,7 +888,7 @@ impl<'a> Tokenizer<'a> {
                     let mut exponent_part = String::new();
                     // Parse exponent as number
                     if chars.peek() == Some(&'e') || chars.peek() == Some(&'E') {
-                        let mut char_clone = chars.peekable.clone();
+                        let mut char_clone = chars.peekable.lookahead().peekable();
                         exponent_part.push(char_clone.next().unwrap());
 
                         // Optional sign
@@ -1239,9 +1201,9 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Consume the next character, then parse a custom binary operator. The next character should be included in the prefix
-    fn consume_for_binop(
+    fn consume_for_binop<I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
         prefix: &str,
         default: Token,
     ) -> Result<Option<Token>, TokenizerError> {
@@ -1250,9 +1212,9 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// parse a custom binary operator
-    fn start_binop(
+    fn start_binop<I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
         prefix: &str,
         default: Token,
     ) -> Result<Option<Token>, TokenizerError> {
@@ -1272,7 +1234,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Tokenize dollar preceded value (i.e: a string/placeholder)
-    fn tokenize_dollar_preceded_value(&self, chars: &mut State) -> Result<Token, TokenizerError> {
+    fn tokenize_dollar_preceded_value<I: Iterator<Item = char>>(&self, chars: &mut State<I>) -> Result<Token, TokenizerError> {
         let mut s = String::new();
         let mut value = String::new();
 
@@ -1384,7 +1346,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     // Consume characters until newline
-    fn tokenize_single_line_comment(&self, chars: &mut State) -> String {
+    fn tokenize_single_line_comment<I: Iterator<Item = char>>(&self, chars: &mut State<I>) -> String {
         let mut comment = peeking_take_while(chars, |ch| ch != '\n');
         if let Some(ch) = chars.next() {
             assert_eq!(ch, '\n');
@@ -1394,7 +1356,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Tokenize an identifier or keyword, after the first char is already consumed.
-    fn tokenize_word(&self, first_chars: impl Into<String>, chars: &mut State) -> String {
+    fn tokenize_word<I: Iterator<Item = char>>(&self, first_chars: impl Into<String>, chars: &mut State<I>) -> String {
         let mut s = first_chars.into();
         s.push_str(&peeking_take_while(chars, |ch| {
             self.dialect.is_identifier_part(ch)
@@ -1403,10 +1365,10 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Read a single quoted string, starting with the opening quote.
-    fn tokenize_escaped_single_quoted_string(
+    fn tokenize_escaped_single_quoted_string<I: Iterator<Item = char>>(
         &self,
         starting_loc: Location,
-        chars: &mut State,
+        chars: &mut State<I>,
     ) -> Result<String, TokenizerError> {
         if let Some(s) = unescape_single_quoted_string(chars) {
             return Ok(s);
@@ -1417,9 +1379,9 @@ impl<'a> Tokenizer<'a> {
 
     /// Reads a string literal quoted by a single or triple quote characters.
     /// Examples: `'abc'`, `'''abc'''`, `"""abc"""`.
-    fn tokenize_single_or_triple_quoted_string<F>(
+    fn tokenize_single_or_triple_quoted_string<F, I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
         quote_style: char,
         backslash_escape: bool,
         single_quote_token: F,
@@ -1473,9 +1435,9 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Reads a string literal quoted by a single quote character.
-    fn tokenize_single_quoted_string(
+    fn tokenize_single_quoted_string<I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
         quote_style: char,
         backslash_escape: bool,
     ) -> Result<String, TokenizerError> {
@@ -1491,9 +1453,9 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Read a quoted string.
-    fn tokenize_quoted_string(
+    fn tokenize_quoted_string<I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
         settings: TokenizeQuotedStringSettings,
     ) -> Result<String, TokenizerError> {
         let mut s = String::new();
@@ -1592,9 +1554,9 @@ impl<'a> Tokenizer<'a> {
         self.tokenizer_error(error_loc, "Unterminated string literal")
     }
 
-    fn tokenize_multiline_comment(
+    fn tokenize_multiline_comment<I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
     ) -> Result<Option<Token>, TokenizerError> {
         let mut s = String::new();
         let mut nested = 1;
@@ -1625,7 +1587,7 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn parse_quoted_ident(&self, chars: &mut State, quote_end: char) -> (String, Option<char>) {
+    fn parse_quoted_ident<I: Iterator<Item = char>>(&self, chars: &mut State<I>, quote_end: char) -> (String, Option<char>) {
         let mut last_char = None;
         let mut s = String::new();
         while let Some(ch) = chars.next() {
@@ -1649,9 +1611,9 @@ impl<'a> Tokenizer<'a> {
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn consume_and_return(
+    fn consume_and_return<I: Iterator<Item = char>>(
         &self,
-        chars: &mut State,
+        chars: &mut State<I>,
         t: Token,
     ) -> Result<Option<Token>, TokenizerError> {
         chars.next();
@@ -1662,7 +1624,7 @@ impl<'a> Tokenizer<'a> {
 /// Read from `chars` until `predicate` returns `false` or EOF is hit.
 /// Return the characters read as String, and keep the first non-matching
 /// char available as `chars.next()`.
-fn peeking_take_while(chars: &mut State, mut predicate: impl FnMut(char) -> bool) -> String {
+fn peeking_take_while<I: Iterator<Item = char>>(chars: &mut State<I>, mut predicate: impl FnMut(char) -> bool) -> String {
     let mut s = String::new();
     while let Some(&ch) = chars.peek() {
         if predicate(ch) {
@@ -1675,16 +1637,16 @@ fn peeking_take_while(chars: &mut State, mut predicate: impl FnMut(char) -> bool
     s
 }
 
-fn unescape_single_quoted_string(chars: &mut State<'_>) -> Option<String> {
+fn unescape_single_quoted_string<I: Iterator<Item = char>>(chars: &mut State<I>) -> Option<String> {
     Unescape::new(chars).unescape()
 }
 
-struct Unescape<'a: 'b, 'b> {
-    chars: &'b mut State<'a>,
+struct Unescape<'b, I: 'b + Iterator<Item = char>> {
+    chars: &'b mut State<I>,
 }
 
-impl<'a: 'b, 'b> Unescape<'a, 'b> {
-    fn new(chars: &'b mut State<'a>) -> Self {
+impl<'b, I: 'b + Iterator<Item = char>> Unescape<'b, I> {
+    fn new(chars: &'b mut State<I>) -> Self {
         Self { chars }
     }
     fn unescape(mut self) -> Option<String> {
@@ -1823,7 +1785,7 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     }
 }
 
-fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String, TokenizerError> {
+fn unescape_unicode_single_quoted_string<I: Iterator<Item = char>>(chars: &mut State<I>) -> Result<String, TokenizerError> {
     let mut unescaped = String::new();
     chars.next(); // consume the opening quote
     while let Some(c) = chars.next() {
@@ -1858,8 +1820,8 @@ fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String
     })
 }
 
-fn take_char_from_hex_digits(
-    chars: &mut State<'_>,
+fn take_char_from_hex_digits<I: Iterator<Item = char>>(
+    chars: &mut State<I>,
     max_digits: usize,
 ) -> Result<char, TokenizerError> {
     let mut result = 0u32;

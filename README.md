@@ -1,4 +1,6 @@
-# Extensible SQL Lexer and Parser for Rust
+# Fork of Extensible SQL Lexer and Parser for Rust
+
+This forks modifies the parser to read lazily from a file to avoid having all tokens in memory at once. Crashes on invalid input.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Version](https://img.shields.io/crates/v/sqlparser.svg)](https://crates.io/crates/sqlparser)

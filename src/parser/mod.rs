@@ -20,10 +20,12 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use lazy_tokens::LazyTokens;
 use core::{
     fmt::{self, Display},
     str::FromStr,
 };
+use std::fs::File;
 
 use log::debug;
 
@@ -39,6 +41,7 @@ use crate::keywords::{Keyword, ALL_KEYWORDS};
 use crate::tokenizer::*;
 
 mod alter;
+pub mod lazy_tokens;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParserError {
@@ -264,7 +267,7 @@ enum ParserState {
 }
 
 pub struct Parser<'a> {
-    tokens: Vec<TokenWithLocation>,
+    tokens: LazyTokens<'a>,
     /// The index of the first unprocessed token in [`Parser::tokens`].
     index: usize,
     /// The current state of the parser.
@@ -295,9 +298,9 @@ impl<'a> Parser<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(dialect: &'a dyn Dialect) -> Self {
+    pub fn new(dialect: &'a dyn Dialect, file: File) -> Self {
         Self {
-            tokens: vec![],
+            tokens: LazyTokens::new(dialect, file),
             index: 0,
             state: ParserState::Normal,
             dialect,
@@ -357,40 +360,6 @@ impl<'a> Parser<'a> {
         self
     }
 
-    /// Reset this parser to parse the specified token stream
-    pub fn with_tokens_with_locations(mut self, tokens: Vec<TokenWithLocation>) -> Self {
-        self.tokens = tokens;
-        self.index = 0;
-        self
-    }
-
-    /// Reset this parser state to parse the specified tokens
-    pub fn with_tokens(self, tokens: Vec<Token>) -> Self {
-        // Put in dummy locations
-        let tokens_with_locations: Vec<TokenWithLocation> = tokens
-            .into_iter()
-            .map(|token| TokenWithLocation {
-                token,
-                location: Location { line: 0, column: 0 },
-            })
-            .collect();
-        self.with_tokens_with_locations(tokens_with_locations)
-    }
-
-    /// Tokenize the sql string and sets this [`Parser`]'s state to
-    /// parse the resulting tokens
-    ///
-    /// Returns an error if there was an error tokenizing the SQL string.
-    ///
-    /// See example on [`Parser::new()`] for an example
-    pub fn try_with_sql(self, sql: &str) -> Result<Self, ParserError> {
-        debug!("Parsing sql '{}'...", sql);
-        let tokens = Tokenizer::new(self.dialect, sql)
-            .with_unescape(self.options.unescape)
-            .tokenize_with_location()?;
-        Ok(self.with_tokens_with_locations(tokens))
-    }
-
     /// Parse potentially multiple statements
     ///
     /// Example
@@ -438,25 +407,6 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
-    /// Convenience method to parse a string with one or more SQL
-    /// statements into produce an Abstract Syntax Tree (AST).
-    ///
-    /// Example
-    /// ```
-    /// # use sqlparser::{parser::{Parser, ParserError}, dialect::GenericDialect};
-    /// # fn main() -> Result<(), ParserError> {
-    /// let dialect = GenericDialect{};
-    /// let statements = Parser::parse_sql(
-    ///   &dialect, "SELECT * FROM foo"
-    /// )?;
-    /// assert_eq!(statements.len(), 1);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn parse_sql(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Statement>, ParserError> {
-        Parser::new(dialect).try_with_sql(sql)?.parse_statements()
-    }
-
     /// Parse a single top-level statement (such as SELECT, INSERT, CREATE, etc.),
     /// stopping before the statement separator, if any.
     pub fn parse_statement(&mut self) -> Result<Statement, ParserError> {
@@ -468,7 +418,7 @@ impl<'a> Parser<'a> {
         }
 
         let next_token = self.next_token();
-        match &next_token.token {
+        let statement = match &next_token.token {
             Token::Word(w) => match w.keyword {
                 Keyword::KILL => self.parse_kill(),
                 Keyword::FLUSH => self.parse_flush(),
@@ -554,7 +504,9 @@ impl<'a> Parser<'a> {
                 self.parse_query().map(Statement::Query)
             }
             _ => self.expected("an SQL statement", next_token),
-        }
+        };
+        self.tokens.clear(self.index);
+        statement
     }
 
     pub fn parse_flush(&mut self) -> Result<Statement, ParserError> {
@@ -3129,7 +3081,7 @@ impl<'a> Parser<'a> {
             {
                 continue;
             }
-            break token.cloned().unwrap_or(TokenWithLocation {
+            break token.unwrap_or(TokenWithLocation {
                 token: Token::EOF,
                 location: Location { line: 0, column: 0 },
             });
@@ -3148,7 +3100,7 @@ impl<'a> Parser<'a> {
                 }) => continue,
                 non_whitespace => {
                     if n == 0 {
-                        return non_whitespace.cloned().unwrap_or(TokenWithLocation {
+                        return non_whitespace.unwrap_or(TokenWithLocation {
                             token: Token::EOF,
                             location: Location { line: 0, column: 0 },
                         });
@@ -3169,7 +3121,6 @@ impl<'a> Parser<'a> {
     pub fn peek_nth_token_no_skip(&self, n: usize) -> TokenWithLocation {
         self.tokens
             .get(self.index + n)
-            .cloned()
             .unwrap_or(TokenWithLocation {
                 token: Token::EOF,
                 location: Location { line: 0, column: 0 },
@@ -3189,7 +3140,6 @@ impl<'a> Parser<'a> {
                 }) => continue,
                 token => {
                     return token
-                        .cloned()
                         .unwrap_or_else(|| TokenWithLocation::wrap(Token::EOF))
                 }
             }
@@ -3197,7 +3147,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Return the first unprocessed token, possibly whitespace.
-    pub fn next_token_no_skip(&mut self) -> Option<&TokenWithLocation> {
+    pub fn next_token_no_skip(&mut self) -> Option<TokenWithLocation> {
         self.index += 1;
         self.tokens.get(self.index - 1)
     }
@@ -5863,6 +5813,13 @@ impl<'a> Parser<'a> {
             None
         };
 
+        // PACK_KEYS nonesense
+        if matches!(self.peek_token().token, Token::Word(Word { value, .. }) if value == "PACK_KEYS") {
+            self.next_token();
+            self.expect_token(&Token::Eq)?;
+            self.next_token();
+        }
+
         let on_commit: Option<OnCommit> =
             if self.parse_keywords(&[Keyword::ON, Keyword::COMMIT, Keyword::DELETE, Keyword::ROWS])
             {
@@ -7518,7 +7475,7 @@ impl<'a> Parser<'a> {
     pub fn parse_tab_value(&mut self) -> Vec<Option<String>> {
         let mut values = vec![];
         let mut content = String::from("");
-        while let Some(t) = self.next_token_no_skip().map(|t| &t.token) {
+        while let Some(t) = self.next_token_no_skip().map(|t| t.token) {
             match t {
                 Token::Whitespace(Whitespace::Tab) => {
                     values.push(Some(content.to_string()));
@@ -8364,7 +8321,6 @@ impl<'a> Parser<'a> {
 
                         let token = self
                             .next_token_no_skip()
-                            .cloned()
                             .unwrap_or(TokenWithLocation::wrap(Token::EOF));
                         requires_whitespace = match token.token {
                             Token::Word(next_word) if next_word.quote_style.is_none() => {
@@ -12250,10 +12206,13 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // TODO: This should just consume the lazytoken.
+    /*
     /// Consume the parser and return its underlying token buffer
     pub fn into_tokens(self) -> Vec<TokenWithLocation> {
         self.tokens
     }
+    */
 
     /// Returns true if the next keyword indicates a sub query, i.e. SELECT or WITH
     fn peek_sub_query(&mut self) -> bool {

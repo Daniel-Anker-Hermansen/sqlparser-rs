@@ -31,8 +31,6 @@ mod sqlite;
 
 use core::any::{Any, TypeId};
 use core::fmt::Debug;
-use core::iter::Peekable;
-use core::str::Chars;
 
 use log::debug;
 
@@ -134,7 +132,7 @@ pub trait Dialect: Debug + Any {
     }
 
     /// Determine if quoted characters are proper for identifier
-    fn is_proper_identifier_inside_quotes(&self, mut _chars: Peekable<Chars<'_>>) -> bool {
+    fn is_proper_identifier_inside_quotes(&self) -> bool {
         true
     }
 
