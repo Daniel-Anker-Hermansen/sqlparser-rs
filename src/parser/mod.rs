@@ -25,7 +25,7 @@ use core::{
     fmt::{self, Display},
     str::FromStr,
 };
-use std::fs::File;
+use std::{fs::File, io::Read};
 
 use log::debug;
 
@@ -267,7 +267,7 @@ enum ParserState {
 }
 
 pub struct Parser<'a> {
-    tokens: LazyTokens<'a>,
+    tokens: LazyTokens<'a, Box<dyn Read + 'a>>,
     /// The index of the first unprocessed token in [`Parser::tokens`].
     index: usize,
     /// The current state of the parser.
@@ -300,7 +300,18 @@ impl<'a> Parser<'a> {
     /// ```
     pub fn new(dialect: &'a dyn Dialect, file: File) -> Self {
         Self {
-            tokens: LazyTokens::new(dialect, file),
+            tokens: LazyTokens::new(dialect, Box::new(file)),
+            index: 0,
+            state: ParserState::Normal,
+            dialect,
+            recursion_counter: RecursionCounter::new(DEFAULT_REMAINING_DEPTH),
+            options: ParserOptions::new().with_trailing_commas(dialect.supports_trailing_commas()),
+        }
+    }
+    
+    pub fn new_read(dialect: &'a dyn Dialect, file: impl Read + 'a) -> Self {
+        Self {
+            tokens: LazyTokens::new(dialect, Box::new(file)),
             index: 0,
             state: ParserState::Normal,
             dialect,

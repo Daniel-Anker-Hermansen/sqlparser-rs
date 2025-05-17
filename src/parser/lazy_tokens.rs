@@ -1,17 +1,17 @@
 use core::cell::RefCell;
-use std::{collections::VecDeque, fs::File, io::{BufReader, Bytes, Read}};
+use std::{collections::VecDeque, io::{BufReader, Bytes, Read}};
 
 use super::{Dialect, State, TokenWithLocation, Tokenizer};
 
-pub struct LazyTokens<'a> {
+pub struct LazyTokens<'a, R: Read> {
     tokenizer: Tokenizer<'a>,
     buf: RefCell<VecDeque<TokenWithLocation>>,
     buf_index: usize,
-    state: RefCell<State<Utf8Iter>>,
+    state: RefCell<State<Utf8Iter<R>>>,
 }
 
-impl<'a> LazyTokens<'a> {
-    pub fn new(dialect: &'a dyn Dialect, file: File) -> Self {
+impl<'a, R: Read> LazyTokens<'a, R> {
+    pub fn new(dialect: &'a dyn Dialect, file: R) -> Self {
         Self {
             tokenizer: Tokenizer::new(dialect),
             buf: RefCell::new(VecDeque::new()),
@@ -51,11 +51,11 @@ impl<'a> LazyTokens<'a> {
     }
 }
 
-struct Utf8Iter {
-	bytes: Bytes<BufReader<File>>,
+struct Utf8Iter<R: Read> {
+	bytes: Bytes<BufReader<R>>,
 }
 
-impl Iterator for Utf8Iter {
+impl<R: Read> Iterator for Utf8Iter<R> {
     type Item = char;
 
     fn next(&mut self) -> Option<Self::Item> {
